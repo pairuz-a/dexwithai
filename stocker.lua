@@ -323,7 +323,7 @@ local function runRestockScript()
             task.wait(0.1)
             local distance = (RootPart.Position - part.Position).Magnitude
             if distance <= cd.MaxActivationDistance then
-                fireclickdetector(cd, 0)
+                fireclickdetector(cd, distance)
                 task.wait(0.5)
             else
                 warn("Too far to click! Distance: " .. tostring(distance) .. " (Max: " .. tostring(cd.MaxActivationDistance) .. ")")
