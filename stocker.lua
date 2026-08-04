@@ -1,20 +1,25 @@
--- PPPAPAPAICUMSSSSSSSSS
-
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
+-- ============================================================
+-- ============================================================
 local existing = PlayerGui:FindFirstChild("PapapaikumGUI")
 if existing then existing:Destroy() end
 
+-- ============================================================
+-- ============================================================
 local scriptActive = false
 local scriptThread = nil
+local afkThread = nil
 
 _G.PapapaikumActiveSpots = _G.PapapaikumActiveSpots or {}
 _G.PapapaikumSpotsToRestock = _G.PapapaikumSpotsToRestock or {}
 
+-- ============================================================
+-- ============================================================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "PapapaikumGUI"
 ScreenGui.ResetOnSpawn = false
@@ -122,12 +127,15 @@ local BtnCorner = Instance.new("UICorner")
 BtnCorner.CornerRadius = UDim.new(0, 6)
 BtnCorner.Parent = ToggleBtn
 
+-- Outer border/stroke on button
 local BtnStroke = Instance.new("UIStroke")
 BtnStroke.Color = Color3.fromRGB(90, 60, 200)
 BtnStroke.Thickness = 1
 BtnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 BtnStroke.Parent = ToggleBtn
 
+-- ============================================================
+-- ============================================================
 local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local function tweenBtnOn()
@@ -160,6 +168,8 @@ local function tweenBtnOff()
     ToggleBtn.Text = "START"
 end
 
+-- ============================================================
+-- ============================================================
 ToggleBtn.MouseEnter:Connect(function()
     if not scriptActive then
         TweenService:Create(ToggleBtn, TweenInfo.new(0.1), {
@@ -184,7 +194,8 @@ ToggleBtn.MouseLeave:Connect(function()
     end
 end)
 
---restock
+-- ============================================================
+-- ============================================================
 local function runRestockScript()
     local Players2 = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
@@ -246,10 +257,10 @@ local function runRestockScript()
             end
         end
     end)
-    _G.PapapaikumJobConnection = jobConnection 
+    _G.PapapaikumJobConnection = jobConnection  
 
     local function walkTo(targetPos)
-        local distanceThreshold = 2.0
+        local distanceThreshold = 1.5
         Controls:Disable()
 
         local function getPath(start, target)
@@ -323,7 +334,7 @@ local function runRestockScript()
             task.wait(0.1)
             local distance = (RootPart.Position - part.Position).Magnitude
             if distance <= cd.MaxActivationDistance then
-                fireclickdetector(cd, distance)
+                fireclickdetector(cd, 0)
                 task.wait(0.5)
             else
                 warn("Too far to click! Distance: " .. tostring(distance) .. " (Max: " .. tostring(cd.MaxActivationDistance) .. ")")
@@ -331,7 +342,6 @@ local function runRestockScript()
         end
     end
 
-    -- Main loop
     local jlf = Workspace:WaitForChild("Jobs"):WaitForChild("Restock"):WaitForChild("JLF")
     local stockBox = jlf:WaitForChild("Stock")
 
@@ -393,7 +403,7 @@ local function runRestockScript()
                 print("Walking to closest spot...")
                 walkTo(closestSpot.Position)
                 if _G.StopRestock then break end
-                task.wait(0.8)
+                task.wait(1.5)
                 interactWith(closestSpot)
 
                 local waitStart = os.clock()
@@ -411,19 +421,31 @@ local function runRestockScript()
     end
 end
 
+-- ============================================================
+-- ============================================================
 ToggleBtn.MouseButton1Click:Connect(function()
     scriptActive = not scriptActive
 
     if scriptActive then
-        -- START
         _G.StopRestock = nil
         tweenBtnOn()
+
+        local VirtualUser = game:GetService("VirtualUser")
+        afkThread = task.spawn(function()
+            while scriptActive do
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+                task.wait(60)
+            end
+        end)
+
         scriptThread = task.spawn(function()
             local ok, err = pcall(runRestockScript)
             if not ok then
                 warn("Restock script error: " .. tostring(err))
                 scriptActive = false
                 tweenBtnOff()
+                if afkThread then task.cancel(afkThread) afkThread = nil end
             end
         end)
     else
@@ -434,6 +456,10 @@ ToggleBtn.MouseButton1Click:Connect(function()
         if scriptThread then
             task.cancel(scriptThread)
             scriptThread = nil
+        end
+        if afkThread then
+            task.cancel(afkThread)
+            afkThread = nil
         end
     end
 end)
