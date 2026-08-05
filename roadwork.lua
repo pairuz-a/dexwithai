@@ -181,16 +181,17 @@ function RoadworkFarm:GetScanParts()
     return parts
 end
 
--- Finds the nearest Roadwork buy button within MaxBuyDistance
-function RoadworkFarm:GetNearbyBuyButton()
+function RoadworkFarm:AutoBuy()
     local distToGym = (RootPart.Position - self.BoxingGymPos).Magnitude
-    if distToGym > self.GymProximity then return nil end
-
+    if distToGym > self.GymProximity then
+        return false
+    end
+    
     local buyFolder = Workspace:FindFirstChild("BuyButtons")
-    if not buyFolder then return nil end
-
+    if not buyFolder then return false end
+    
     local closest, closestDist = nil, self.MaxBuyDistance
-
+    
     for _, child in ipairs(buyFolder:GetChildren()) do
         if child.Name == "Roadwork" and child:IsA("BasePart") then
             local btnDistToGym = (child.Position - self.BoxingGymPos).Magnitude
@@ -202,39 +203,56 @@ function RoadworkFarm:GetNearbyBuyButton()
             end
         end
     end
-
-    return closest
+    
+    if not closest then return false end
+    
+    local detector = closest:FindFirstChildOfClass("ClickDetector")
+    local fireclick = getgenv().fireclickdetector or fireclickdetector
+    
+    if detector and fireclick then
+        fireclick(detector)
+        return true
+    end
+    
+    return false
 end
 
--- Spam buy loop: runs independently, buys whenever in range
-function RoadworkFarm:StartAutoBuyLoop()
+function RoadworkFarm:Start()
+    self.Active = true
+    self.TouchedCache = {}
+    self.ZonesPurged = false
+    self:PurgeZones()
+
+    -- Notif hider loop
     task.spawn(function()
         while self.Active do
-            task.wait(0.3)
-
-            if not self.AutoBuy then continue end
-
-            local btn = self:GetNearbyBuyButton()
-            if not btn then continue end
-
-            local detector = btn:FindFirstChildOfClass("ClickDetector")
-            local fireclick = getgenv().fireclickdetector or fireclickdetector
-
-            if detector and fireclick then
-                pcall(function() fireclick(detector) end)
-
-                -- Auto equip immediately after buying
-                task.wait(0.3)
-                self:EquipTool()
+            task.wait(0.1)
+            local pg = GetPlayerGui()
+            if not pg then continue end
+            for _, name in ipairs({"NewNotif", "NotifInterface"}) do
+                local gui = pg:FindFirstChild(name)
+                if gui then
+                    pcall(function() gui.Enabled = false end)
+                end
             end
         end
     end)
-end
 
-function RoadworkFarm:StartEquipLoop()
+    -- Auto buy loop: every 3.5s regardless of tool count
     task.spawn(function()
         while self.Active do
-            task.wait(0.15)
+            task.wait(3.5)
+            if not self.Active then break end
+            if self.AutoBuy then
+                self:AutoBuy()
+            end
+        end
+    end)
+
+    -- Auto equip loop: spam equip every 0.15s
+    task.spawn(function()
+        while self.Active do
+            task.wait(0.1)
             if not Character or not RootPart then continue end
             local tool = self:GetTool()
             if tool and tool.Parent ~= Character then
@@ -244,16 +262,8 @@ function RoadworkFarm:StartEquipLoop()
             end
         end
     end)
-end
 
-function RoadworkFarm:Start()
-    self.Active = true
-    self.TouchedCache = {}
-    self.ZonesPurged = false
-    self:PurgeZones()
-    self:StartAutoBuyLoop()
-    self:StartEquipLoop()
-    
+    -- Main scan loop
     task.spawn(function()
         while self.Active do
             if not Character or not RootPart or Humanoid.Health <= 0 then
@@ -279,6 +289,13 @@ end
 function RoadworkFarm:Stop()
     self.Active = false
     self.TouchedCache = {}
+    local pg = GetPlayerGui()
+    if pg then
+        for _, name in ipairs({"NewNotif", "NotifInterface"}) do
+            local gui = pg:FindFirstChild(name)
+            if gui then pcall(function() gui.Enabled = true end) end
+        end
+    end
 end
 
 Workspace.ChildAdded:Connect(function(child)
@@ -518,7 +535,7 @@ TrainTab:Slider({
 })
 
 TrainTab:Toggle({
-    name = "Auto Buy (Spam when in range)",
+    name = "Auto Buy (every 3.5s when in range)",
     default = true,
     callback = function(v)
         RoadworkFarm.AutoBuy = v
