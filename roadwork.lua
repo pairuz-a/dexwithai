@@ -1,778 +1,657 @@
-
--- ── Load Library ──────────────────────────────────────────────────────────────
 local Library = loadstring(game:HttpGet(
     "https://codeberg.org/VenomVent/Ventura-UI/raw/branch/main/VenturaLibrary.lua"
 ))()
 
--- ── Window ────────────────────────────────────────────────────────────────────
 local GUI = Library:new({
-    name        = "Jobs & Farming Hub",
-    subtitle    = "Silent Roadwork • Auto Restock",
-    accent      = Color3.fromRGB(90, 60, 200),
-    toggleKey   = Enum.KeyCode.Insert,
+    name = "Jobs & Farming Hub",
+    subtitle = "Silent Roadwork • Auto Restock",
+    accent = Color3.fromRGB(90, 60, 200),
+    toggleKey = Enum.KeyCode.Insert,
     minimizeKey = Enum.KeyCode.K,
     loadingTime = 1.5,
-    keyEnabled  = false,
+    keyEnabled = false,
 })
 
--- ── Services ──────────────────────────────────────────────────────────────────
+
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local GuiService = game:GetService("GuiService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local PathfindingService = game:GetService("PathfindingService")
+
 local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local RootPart = Character:WaitForChild("HumanoidRootPart")
 
--- ════════════════════════════════════════════════════════════════════════════
---  STAT SELECTION SYSTEM
--- ════════════════════════════════════════════════════════════════════════════
+LocalPlayer.CharacterAdded:Connect(function(char)
+    Character = char
+    Humanoid = char:WaitForChild("Humanoid")
+    RootPart = char:WaitForChild("HumanoidRootPart")
+end)
 
-local StatSettings = {
-    AutoSelect = false,
-    SelectedStat = "Stamina" -- "Stamina" or "Agility"
-}
 
-local function PhysicalClick(guiObject: GuiObject)
-    if not guiObject or not guiObject.AbsolutePosition then return end
 
-    local absPos = guiObject.AbsolutePosition
-    local absSize = guiObject.AbsoluteSize
+local function GetPlayerGui()
+    return LocalPlayer:FindFirstChildOfClass("PlayerGui")
+end
+
+local function PhysicalClick(guiObject)
+    if not guiObject or not guiObject.AbsolutePosition then return false end
+    
+    local pos = guiObject.AbsolutePosition
+    local size = guiObject.AbsoluteSize
     local inset = GuiService:GetGuiInset()
-
-    local clickX = absPos.X + (absSize.X / 2)
-    local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1)
+    
+    local x = pos.X + size.X / 2
+    local y = pos.Y + size.Y / 2 + inset.Y
+    
+    local success = pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
         task.wait(0.05)
-        VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1)
-    end)
-end
-
-local function SelectStat(statName: string)
-    pcall(function()
-        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
-        if not playerGui then return end
-
-        local btns = playerGui:FindFirstChild("Machines")
-            and playerGui.Machines:FindFirstChild("Container")
-            and playerGui.Machines.Container:FindFirstChild("btns")
-
-        if not btns then return end
-
-        -- Try exact match first, then case-insensitive partial match
-        local targetStat = btns:FindFirstChild(statName)
-        if not targetStat then
-            local lowerTarget = string.lower(statName)
-            for _, child in ipairs(btns:GetChildren()) do
-                if string.lower(child.Name):find(lowerTarget, 1, true) then
-                    targetStat = child
-                    break
-                end
-            end
-        end
-
-        if not targetStat then
-            -- Debug: print available stat buttons so you can fix the name
-            local names = {}
-            for _, child in ipairs(btns:GetChildren()) do
-                table.insert(names, child.Name)
-            end
-            warn("[SelectStat] Could not find stat '" .. statName .. "'. Available: " .. table.concat(names, ", "))
-            return
-        end
-
-        local innerFrame = targetStat:FindFirstChild("frame")
-        local imgBtn = innerFrame and innerFrame:FindFirstChild("img")
-
-        local clickableObject = imgBtn or innerFrame or targetStat
-
-        if clickableObject and clickableObject:IsA("GuiObject") then
-            PhysicalClick(clickableObject)
-        end
-    end)
-end
-
--- ════════════════════════════════════════════════════════════════════════════
---  SILENT ROADWORK (NEW BUY LOGIC)
--- ════════════════════════════════════════════════════════════════════════════
-
-type FarmState = {
-    IsFarming: boolean,
-    AutoBuy: boolean,
-    ScanSpeed: number,
-    MaxBuyDistance: number,
-    SelectedStat: string
-}
-
-local FarmService = {}
-FarmService.__index = FarmService
-
-export type FarmServiceClass = typeof(setmetatable({} :: FarmState, FarmService))
-
-local touchedParts = {} -- Debounce tracking
-
-function FarmService.new(): FarmServiceClass
-    local self: FarmState = {
-        IsFarming = false,
-        AutoBuy = true,
-        ScanSpeed = 0.08,
-        MaxBuyDistance = 30,
-        SelectedStat = "Stamina"
-    }
-    return setmetatable(self, FarmService) :: any
-end
-
-function FarmService.PurgeZones(self: FarmServiceClass): ()
-    pcall(function()
-        local zones = workspace:FindFirstChild("Zones") or workspace:FindFirstChild("zones")
-        if zones then
-            local streets = zones:FindFirstChild("Streets") or zones:FindFirstChild("streets")
-            if streets then
-                for _, child in ipairs(streets:GetChildren()) do
-                    pcall(function() child:Destroy() end)
-                end
-                pcall(function() streets:Destroy() end)
-            end
-        end
-    end)
-end
-
-function FarmService.SilentTouch(self: FarmServiceClass, hrp: BasePart, targetPart: BasePart): ()
-    if not hrp or not targetPart or not targetPart.Parent then return end
-    if not targetPart:IsDescendantOf(workspace) then return end
-    
-    -- Debounce check
-    if touchedParts[targetPart] then return end
-    touchedParts[targetPart] = true
-    
-    pcall(function()
-        self:PurgeZones()
-        local firetouch = (getgenv() :: any).firetouchinterest or firetouchinterest
-        if firetouch then
-            firetouch(hrp, targetPart, 0)
-            task.wait(0.02)
-            firetouch(hrp, targetPart, 1)
-        end
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
     end)
     
-    -- Clear debounce after 3s
-    task.delay(3, function()
-        touchedParts[targetPart] = nil
-    end)
-end
-
--- ── Tool helpers ─────────────────────────────────────────────────────────────
-function FarmService.GetRoadworkTool(self: FarmServiceClass): Tool?
-    local char = LocalPlayer.Character
-    if char then
-        local t = char:FindFirstChild("Roadwork")
-        if t and t:IsA("Tool") then return t :: Tool end
-    end
-    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
-    if backpack then
-        local t = backpack:FindFirstChild("Roadwork")
-        if t and t:IsA("Tool") then return t :: Tool end
-    end
-    return nil
-end
-
-function FarmService.HasRoadwork(self: FarmServiceClass): boolean
-    return self:GetRoadworkTool() ~= nil
-end
-
-function FarmService.EquipAndActivateRoadwork(self: FarmServiceClass): boolean
-    local tool = self:GetRoadworkTool()
-    if not tool then return false end
-    local char = LocalPlayer.Character
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    if tool.Parent ~= char and humanoid then
-        humanoid:EquipTool(tool)
-        task.wait(0.2)
-    end
-    pcall(function() tool:Activate() end)
-    task.wait(0.2)
-    return true
-end
-
--- ── Stat UI click ────────────────────────────────────────────────────────────
-function FarmService.SelectStatUI(self: FarmServiceClass): ()
-    pcall(function()
-        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
-        if not playerGui then return end
-        local btns = playerGui:FindFirstChild("Machines")
-            and playerGui.Machines:FindFirstChild("Container")
-            and playerGui.Machines.Container:FindFirstChild("btns")
-        if not btns then return end
-
-        -- Exact match first, then case-insensitive partial fallback
-        local statContainer = btns:FindFirstChild(self.SelectedStat)
-        if not statContainer then
-            local lower = string.lower(self.SelectedStat)
-            for _, child in ipairs(btns:GetChildren()) do
-                if string.lower(child.Name):find(lower, 1, true) then
-                    statContainer = child
-                    break
-                end
-            end
-        end
-        if not statContainer then
-            local names = {}
-            for _, c in ipairs(btns:GetChildren()) do table.insert(names, c.Name) end
-            warn("[SelectStatUI] '" .. self.SelectedStat .. "' not found. Available: " .. table.concat(names, ", "))
-            return
-        end
-
-        local innerFrame = statContainer:FindFirstChild("frame")
-        local imgBtn = innerFrame and innerFrame:FindFirstChild("img")
-        local target = imgBtn or innerFrame or statContainer
-        if target and target:IsA("GuiObject") then
-            PhysicalClick(target)
-        end
-    end)
-end
-
--- ✅ NEW: Improved buy logic with distance checking
-function FarmService.AutoBuyButtons(self: FarmServiceClass): boolean
-    local success = false
-    pcall(function()
-        local buyFolder = workspace:FindFirstChild("BuyButtons")
-        if not buyFolder then return end
-        
-        local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
-        if not hrp then return end
-
-        -- Find all Roadwork buttons
-        local roadworkButtons = {}
-        for _, child in ipairs(buyFolder:GetChildren()) do
-            if child.Name == "Roadwork" and child:IsA("BasePart") then
-                table.insert(roadworkButtons, child)
-            end
-        end
-
-        if #roadworkButtons == 0 then return end
-
-        -- Find closest button within range
-        local closestBtn = nil
-        local closestDist = self.MaxBuyDistance
-
-        for _, btn in ipairs(roadworkButtons) do
-            local dist = (hrp.Position - btn.Position).Magnitude
-            if dist < closestDist then
-                closestDist = dist
-                closestBtn = btn
-            end
-        end
-
-        if not closestBtn then return end
-
-        -- Try to click the closest button
-        local detector = closestBtn:FindFirstChildOfClass("ClickDetector")
-        local fireclick = (getgenv() :: any).fireclickdetector or fireclickdetector
-        
-        if detector and fireclick then
-            fireclick(detector :: ClickDetector)
-            success = true
-            print("[AUTO BUY] Roadwork purchased! Distance:", math.floor(closestDist))
-        end
-    end)
     return success
 end
 
-function FarmService.GetScanParts(self: FarmServiceClass): {BasePart}
-    local targets: {BasePart} = {}
-    local junkFolder = workspace:FindFirstChild("Junk")
+local function IsMachineUIVisible()
+    local pg = GetPlayerGui()
+    if not pg then return false end
     
-    if junkFolder then
-        for _, item: Instance in ipairs(junkFolder:GetChildren()) do
-            -- ✅ FIXED: Only match parts that START with "ScanPart"
-            if item:IsA("BasePart") and string.match(item.Name, "^ScanPart") then
-                -- Only add if valid and not touched recently
-                if item.Parent and item:IsDescendantOf(workspace) and not touchedParts[item] then
-                    table.insert(targets, item)
-                end
-            end
+    local machines = pg:FindFirstChild("Machines")
+    if not machines then return false end
+    
+    local container = machines:FindFirstChild("Container")
+    return container and container.Visible
+end
+
+
+
+local RoadworkFarm = {
+    Active = false,
+    AutoBuy = true,
+    ScanSpeed = 0.08,
+    MaxBuyDistance = 30,
+    SelectedStat = "Stamina",
+    TouchedCache = {},
+    ZonesPurged = false,
+    BoxingGymPos = Vector3.new(-24.290, 39.497, -2.150),
+    GymProximity = 150
+}
+
+function RoadworkFarm:PurgeZones()
+    if self.ZonesPurged then return end
+    
+    local zones = Workspace:FindFirstChild("Zones")
+    if zones then
+        local streets = zones:FindFirstChild("Streets")
+        if streets then
+            pcall(function() streets:Destroy() end)
+            self.ZonesPurged = true
         end
     end
+end
+
+function RoadworkFarm:GetTool()
+    local tool = Character:FindFirstChild("Roadwork")
+    if tool and tool:IsA("Tool") then return tool end
     
-    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
-    if hrp then
-        table.sort(targets, function(a: BasePart, b: BasePart)
-            return (hrp.Position - a.Position).Magnitude < (hrp.Position - b.Position).Magnitude
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if bp then
+        tool = bp:FindFirstChild("Roadwork")
+        if tool and tool:IsA("Tool") then return tool end
+    end
+    
+    return nil
+end
+
+function RoadworkFarm:EquipTool()
+    local tool = self:GetTool()
+    if not tool then return false end
+    
+    if tool.Parent ~= Character then
+        Humanoid:EquipTool(tool)
+        task.wait(0.2)
+    end
+    
+    pcall(function() tool:Activate() end)
+    return true
+end
+
+function RoadworkFarm:SelectStat()
+    if not IsMachineUIVisible() then return false end
+    
+    local pg = GetPlayerGui()
+    if not pg then return false end
+    
+    local btns = pg.Machines.Container.btns
+    local statFrame = btns:FindFirstChild(self.SelectedStat)
+    
+    if not statFrame then return false end
+    
+    local frame = statFrame:FindFirstChild("frame")
+    local img = frame and frame:FindFirstChild("img")
+    
+    return PhysicalClick(img or frame or statFrame)
+end
+
+function RoadworkFarm:SilentTouch(part)
+    if not part or not part.Parent or self.TouchedCache[part] then 
+        return 
+    end
+    
+    self.TouchedCache[part] = true
+    self:PurgeZones()
+    
+    local firetouch = getgenv().firetouchinterest or firetouchinterest
+    if firetouch then
+        pcall(function()
+            firetouch(RootPart, part, 0)
+            task.wait(0.02)
+            firetouch(RootPart, part, 1)
         end)
     end
     
-    return targets
+    task.delay(3, function()
+        self.TouchedCache[part] = nil
+    end)
 end
 
-local RoadworkApp = FarmService.new()
-RoadworkApp:PurgeZones()
+function RoadworkFarm:GetScanParts()
+    local junk = Workspace:FindFirstChild("Junk")
+    if not junk then return {} end
+    
+    local parts = {}
+    for _, item in ipairs(junk:GetChildren()) do
+        if item:IsA("BasePart") and 
+           string.match(item.Name, "^ScanPart") and
+           not self.TouchedCache[item] then
+            table.insert(parts, item)
+        end
+    end
+    
+    table.sort(parts, function(a, b)
+        return (RootPart.Position - a.Position).Magnitude < 
+               (RootPart.Position - b.Position).Magnitude
+    end)
+    
+    return parts
+end
 
-workspace.ChildAdded:Connect(function(child: Instance)
-    if string.lower(child.Name) == "zones" then
+-- Finds the nearest Roadwork buy button within MaxBuyDistance
+function RoadworkFarm:GetNearbyBuyButton()
+    local distToGym = (RootPart.Position - self.BoxingGymPos).Magnitude
+    if distToGym > self.GymProximity then return nil end
+
+    local buyFolder = Workspace:FindFirstChild("BuyButtons")
+    if not buyFolder then return nil end
+
+    local closest, closestDist = nil, self.MaxBuyDistance
+
+    for _, child in ipairs(buyFolder:GetChildren()) do
+        if child.Name == "Roadwork" and child:IsA("BasePart") then
+            local btnDistToGym = (child.Position - self.BoxingGymPos).Magnitude
+            if btnDistToGym < self.GymProximity then
+                local dist = (RootPart.Position - child.Position).Magnitude
+                if dist < closestDist then
+                    closest, closestDist = child, dist
+                end
+            end
+        end
+    end
+
+    return closest
+end
+
+-- Spam buy loop: runs independently, buys whenever in range
+function RoadworkFarm:StartAutoBuyLoop()
+    task.spawn(function()
+        while self.Active do
+            task.wait(0.3)
+
+            if not self.AutoBuy then continue end
+
+            local btn = self:GetNearbyBuyButton()
+            if not btn then continue end
+
+            local detector = btn:FindFirstChildOfClass("ClickDetector")
+            local fireclick = getgenv().fireclickdetector or fireclickdetector
+
+            if detector and fireclick then
+                pcall(function() fireclick(detector) end)
+
+                -- Auto equip immediately after buying
+                task.wait(0.3)
+                self:EquipTool()
+            end
+        end
+    end)
+end
+
+function RoadworkFarm:StartEquipLoop()
+    task.spawn(function()
+        while self.Active do
+            task.wait(0.15)
+            if not Character or not RootPart then continue end
+            local tool = self:GetTool()
+            if tool and tool.Parent ~= Character then
+                pcall(function() Humanoid:EquipTool(tool) end)
+            elseif tool and tool.Parent == Character then
+                pcall(function() tool:Activate() end)
+            end
+        end
+    end)
+end
+
+function RoadworkFarm:Start()
+    self.Active = true
+    self.TouchedCache = {}
+    self.ZonesPurged = false
+    self:PurgeZones()
+    self:StartAutoBuyLoop()
+    self:StartEquipLoop()
+    
+    task.spawn(function()
+        while self.Active do
+            if not Character or not RootPart or Humanoid.Health <= 0 then
+                task.wait(1)
+                continue
+            end
+
+            if IsMachineUIVisible() then
+                self:SelectStat()
+            end
+            
+            for _, part in ipairs(self:GetScanParts()) do
+                if not self.Active then break end
+                self:SilentTouch(part)
+                task.wait(self.ScanSpeed)
+            end
+            
+            task.wait(0.1)
+        end
+    end)
+end
+
+function RoadworkFarm:Stop()
+    self.Active = false
+    self.TouchedCache = {}
+end
+
+Workspace.ChildAdded:Connect(function(child)
+    if child.Name:lower() == "zones" then
         task.wait(0.05)
-        RoadworkApp:PurgeZones()
+        RoadworkFarm:PurgeZones()
     end
 end)
 
-local zonesFolder = workspace:FindFirstChild("Zones") or workspace:FindFirstChild("zones")
-if zonesFolder then
-    zonesFolder.ChildAdded:Connect(function(child: Instance)
-        if string.lower(child.Name) == "streets" then
-            task.wait(0.05)
-            RoadworkApp:PurgeZones()
-        end
-    end)
-end
 
--- ════════════════════════════════════════════════════════════════════════════
---  AUTO RESTOCK
--- ════════════════════════════════════════════════════════════════════════════
 
-_G.PapapaikumActiveSpots = _G.PapapaikumActiveSpots or {}
-_G.PapapaikumSpotsToRestock = _G.PapapaikumSpotsToRestock or {}
+local Restock = {
+    Active = false,
+    ActiveSpots = {},
+    SpotsToRestock = {},
+    Connection = nil
+}
 
-local restockThread = nil
-local restockActive = false
-
-local function runRestockScript()
-    local Workspace = game:GetService("Workspace")
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local RunService = game:GetService("RunService")
-    local PathfindingService = game:GetService("PathfindingService")
-
-    local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    local Humanoid = Character:WaitForChild("Humanoid")
-    local RootPart = Character:WaitForChild("HumanoidRootPart")
-
-    local GamePackets = require(ReplicatedStorage:WaitForChild("GamePackets"))
-    local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
-    local PlayerModule = require(PlayerScripts:WaitForChild("PlayerModule"))
+function Restock:WalkTo(targetPos)
+    local PlayerModule = require(LocalPlayer.PlayerScripts:WaitForChild("PlayerModule"))
     local Controls = PlayerModule:GetControls()
-
-    local activeSpots = _G.PapapaikumActiveSpots
-    local spotsToRestock = _G.PapapaikumSpotsToRestock
-
-    if _G.PapapaikumJobConnection then
-        _G.PapapaikumJobConnection:Disconnect()
-        _G.PapapaikumJobConnection = nil
+    
+    Controls:Disable()
+    
+    local function computePath(start, finish)
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 3,
+            AgentHeight = 6,
+            AgentCanJump = true,
+            WaypointSpacing = 4
+        })
+        
+        local ok = pcall(function() path:ComputeAsync(start, finish) end)
+        if ok and path.Status == Enum.PathStatus.Success then
+            return path:GetWaypoints()
+        end
+        return nil
     end
-
-    local jobConnection
-    jobConnection = GamePackets.JobsClientPush.OnClientEvent:Connect(function(data)
-        if type(data) == "table" and data[1] == "Stocker" then
-            local action = data[2]
-            if action == "BoxPickedUp" then
-                table.clear(activeSpots)
-                local newSpots = data[3] or {}
-                for k, v in pairs(newSpots) do activeSpots[k] = v end
-                table.clear(spotsToRestock)
-                for _, spot in pairs(activeSpots) do
-                    if spot and spot.Parent then
-                        table.insert(spotsToRestock, spot)
-                    end
-                end
-            elseif action == "SpotUsed" then
-                local spotIndex = data[3]
-                if spotIndex then
-                    local spotInstance = activeSpots[spotIndex]
-                    if spotInstance then
-                        activeSpots[spotIndex] = nil
-                        for i = #spotsToRestock, 1, -1 do
-                            if spotsToRestock[i] == spotInstance then
-                                table.remove(spotsToRestock, i)
-                            end
-                        end
-                    end
-                end
-            elseif action == "EndJob" then
-                table.clear(activeSpots)
-                table.clear(spotsToRestock)
+    
+    local waypoints = computePath(RootPart.Position, targetPos) or 
+                     {{Position = targetPos, Action = Enum.PathWaypointAction.Walk}}
+    
+    local idx, lastPos, lastCheck = 1, RootPart.Position, os.clock()
+    
+    while idx <= #waypoints and self.Active do
+        local wp = waypoints[idx]
+        local currentPos = RootPart.Position
+        local targetFlat = Vector3.new(wp.Position.X, currentPos.Y, wp.Position.Z)
+        local dist = (currentPos - targetFlat).Magnitude
+        
+        if dist <= 1.5 then
+            idx = idx + 1
+        else
+            LocalPlayer:Move((targetFlat - currentPos).Unit, false)
+            
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                Humanoid.Jump = true
             end
-        end
-    end)
-    _G.PapapaikumJobConnection = jobConnection
-
-    local function walkTo(targetPos)
-        local distanceThreshold = 1.5
-        Controls:Disable()
-
-        local function getPath(start, target)
-            local path = PathfindingService:CreatePath({
-                AgentRadius = 3,
-                AgentHeight = 6,
-                AgentCanJump = true,
-                WaypointSpacing = 4
-            })
-            local success, _ = pcall(function()
-                path:ComputeAsync(start, target)
-            end)
-            if success and path.Status == Enum.PathStatus.Success then
-                return path:GetWaypoints()
-            end
-            return nil
-        end
-
-        local waypoints = getPath(RootPart.Position, targetPos)
-        if not waypoints then
-            warn("Pathfinding failed, attempting direct walk")
-            waypoints = { { Position = targetPos, Action = Enum.PathWaypointAction.Walk } }
-        end
-
-        local currentWaypointIndex = 1
-        local lastPos = RootPart.Position
-        local lastStuckCheck = os.clock()
-
-        while currentWaypointIndex <= #waypoints do
-            if _G.StopRestock then break end
-            local waypoint = waypoints[currentWaypointIndex]
-            local currentPos = RootPart.Position
-            local targetPosHorizontal = Vector3.new(waypoint.Position.X, currentPos.Y, waypoint.Position.Z)
-            local distance = (currentPos - targetPosHorizontal).Magnitude
-
-            if distance <= distanceThreshold then
-                currentWaypointIndex = currentWaypointIndex + 1
-            else
-                local direction = (targetPosHorizontal - currentPos).Unit
-                LocalPlayer:Move(direction, false)
-
-                if waypoint.Action == Enum.PathWaypointAction.Jump and Humanoid.FloorMaterial ~= Enum.Material.Air then
+            
+            if os.clock() - lastCheck > 1.5 then
+                if (RootPart.Position - lastPos).Magnitude < 1.5 then
                     Humanoid.Jump = true
+                    waypoints = computePath(RootPart.Position, targetPos) or waypoints
+                    idx = 1
                 end
-
-                if os.clock() - lastStuckCheck > 1.5 then
-                    if (RootPart.Position - lastPos).Magnitude < 1.5 then
-                        Humanoid.Jump = true
-                        print("Stuck! Recalculating path...")
-                        local newWaypoints = getPath(RootPart.Position, targetPos)
-                        if newWaypoints then
-                            waypoints = newWaypoints
-                            currentWaypointIndex = 1
-                        end
-                    end
-                    lastPos = RootPart.Position
-                    lastStuckCheck = os.clock()
-                end
+                lastPos = RootPart.Position
+                lastCheck = os.clock()
             end
-            RunService.Heartbeat:Wait()
         end
-
-        LocalPlayer:Move(Vector3.new(0, 0, 0), false)
-        Controls:Enable()
+        
+        RunService.Heartbeat:Wait()
     end
+    
+    LocalPlayer:Move(Vector3.zero, false)
+    Controls:Enable()
+end
 
-    local function interactWith(part)
-        local cd = part:FindFirstChildOfClass("ClickDetector")
-        if cd then
-            RootPart.CFrame = CFrame.new(RootPart.Position, Vector3.new(part.Position.X, RootPart.Position.Y, part.Position.Z))
-            task.wait(0.1)
-            local distance = (RootPart.Position - part.Position).Magnitude
-            if distance <= cd.MaxActivationDistance then
-                fireclickdetector(cd, 0)
-                task.wait(0.5)
-            else
-                warn("Too far to click! Distance: " .. tostring(distance))
-            end
-        end
-    end
-
-    local jlf = Workspace:WaitForChild("Jobs"):WaitForChild("Restock"):WaitForChild("JLF")
-    local stockBox = jlf:WaitForChild("Stock")
-
-    while true do
-        if _G.StopRestock then
-            Controls:Enable()
-            print("Restock script stopped.")
-            break
-        end
-
-        local distanceToJLF = (RootPart.Position - stockBox.Position).Magnitude
-        if distanceToJLF > 100 then
-            print("You're not in the place, cannot start job")
-            task.wait(5)
-            continue
-        end
-
-        local currentJob = LocalPlayer:GetAttribute("CurrentJob")
-        if currentJob ~= "Restocking" then
-            print("Starting Restocking Job...")
-            GamePackets.JobsCommand:Fire({"Stocker"})
-            task.wait(1.5)
-        end
-
-        if #spotsToRestock == 0 then
-            print("Walking to Stock Box...")
-            walkTo(stockBox.Position)
-            if _G.StopRestock then break end
-            task.wait(0.8)
-            interactWith(stockBox)
-
-            local waitStart = os.clock()
-            while #spotsToRestock == 0 and os.clock() - waitStart < 4 do
-                task.wait(0.1)
-                if _G.StopRestock then break end
-            end
-        end
-
-        if _G.StopRestock then break end
-
-        while #spotsToRestock > 0 do
-            if _G.StopRestock then break end
-
-            local closestSpot = nil
-            local closestDistance = math.huge
-            for _, spot in ipairs(spotsToRestock) do
-                if spot and spot.Parent then
-                    local targetPosHorizontal = Vector3.new(spot.Position.X, RootPart.Position.Y, spot.Position.Z)
-                    local dist = (RootPart.Position - targetPosHorizontal).Magnitude
-                    if dist < closestDistance then
-                        closestDistance = dist
-                        closestSpot = spot
-                    end
-                end
-            end
-
-            if closestSpot then
-                print("Walking to closest spot...")
-                walkTo(closestSpot.Position)
-                if _G.StopRestock then break end
-                task.wait(1.5)
-                interactWith(closestSpot)
-
-                local waitStart = os.clock()
-                local initialCount = #spotsToRestock
-                while #spotsToRestock == initialCount and os.clock() - waitStart < 3 do
-                    task.wait(0.1)
-                    if _G.StopRestock then break end
-                end
-            else
-                table.clear(spotsToRestock)
-            end
-            task.wait(0.5)
-        end
-        task.wait(1)
+function Restock:Interact(part)
+    local cd = part:FindFirstChildOfClass("ClickDetector")
+    if not cd then return end
+    
+    RootPart.CFrame = CFrame.new(
+        RootPart.Position, 
+        Vector3.new(part.Position.X, RootPart.Position.Y, part.Position.Z)
+    )
+    task.wait(0.1)
+    
+    if (RootPart.Position - part.Position).Magnitude <= cd.MaxActivationDistance then
+        fireclickdetector(cd, 0)
+        task.wait(0.5)
     end
 end
+
+function Restock:Start()
+    self.Active = true
+    self.ActiveSpots = {}
+    self.SpotsToRestock = {}
+    
+    local GamePackets = require(ReplicatedStorage:WaitForChild("GamePackets"))
+    
+    if self.Connection then
+        self.Connection:Disconnect()
+    end
+    
+    self.Connection = GamePackets.JobsClientPush.OnClientEvent:Connect(function(data)
+        if type(data) ~= "table" or data[1] ~= "Stocker" then return end
+        
+        local action = data[2]
+        
+        if action == "BoxPickedUp" then
+            self.ActiveSpots = data[3] or {}
+            self.SpotsToRestock = {}
+            for _, spot in pairs(self.ActiveSpots) do
+                if spot and spot.Parent then
+                    table.insert(self.SpotsToRestock, spot)
+                end
+            end
+            
+        elseif action == "SpotUsed" then
+            local idx = data[3]
+            if idx then
+                local spot = self.ActiveSpots[idx]
+                self.ActiveSpots[idx] = nil
+                
+                for i = #self.SpotsToRestock, 1, -1 do
+                    if self.SpotsToRestock[i] == spot then
+                        table.remove(self.SpotsToRestock, i)
+                    end
+                end
+            end
+            
+        elseif action == "EndJob" then
+            self.ActiveSpots = {}
+            self.SpotsToRestock = {}
+        end
+    end)
+    
+    task.spawn(function()
+        local stockBox = Workspace.Jobs.Restock.JLF:WaitForChild("Stock")
+        
+        while self.Active do
+            if (RootPart.Position - stockBox.Position).Magnitude > 100 then
+                task.wait(5)
+                continue
+            end
+            
+            if LocalPlayer:GetAttribute("CurrentJob") ~= "Restocking" then
+                GamePackets.JobsCommand:Fire({"Stocker"})
+                task.wait(1.5)
+            end
+            
+            if #self.SpotsToRestock == 0 then
+                self:WalkTo(stockBox.Position)
+                if not self.Active then break end
+                task.wait(0.8)
+                self:Interact(stockBox)
+                
+                local waitStart = os.clock()
+                while #self.SpotsToRestock == 0 and os.clock() - waitStart < 4 do
+                    task.wait(0.1)
+                    if not self.Active then break end
+                end
+            end
+            
+            while #self.SpotsToRestock > 0 and self.Active do
+                local closest, closestDist = nil, math.huge
+                
+                for _, spot in ipairs(self.SpotsToRestock) do
+                    if spot and spot.Parent then
+                        local dist = (RootPart.Position - spot.Position).Magnitude
+                        if dist < closestDist then
+                            closest, closestDist = spot, dist
+                        end
+                    end
+                end
+                
+                if closest then
+                    self:WalkTo(closest.Position)
+                    if not self.Active then break end
+                    task.wait(1.5)
+                    self:Interact(closest)
+                    task.wait(0.5)
+                else
+                    self.SpotsToRestock = {}
+                end
+            end
+            
+            task.wait(1)
+        end
+    end)
+    
+    task.spawn(function()
+        local VirtualUser = game:GetService("VirtualUser")
+        while self.Active do
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+            task.wait(60)
+        end
+    end)
+end
+
+function Restock:Stop()
+    self.Active = false
+    if self.Connection then
+        self.Connection:Disconnect()
+        self.Connection = nil
+    end
+    self.ActiveSpots = {}
+    self.SpotsToRestock = {}
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  UI TABS
+-- ═══════════════════════════════════════════════════════════════════════════
 
 GUI:NavSection("TRAIN")
-local JobsTab = GUI:CreateTab({ name = "Train" })
+local TrainTab = GUI:CreateTab({name = "Train"})
 
-JobsTab:Section({ name = "Silent Roadwork" })
+TrainTab:Section({name = "Silent Roadwork"})
 
-JobsTab:Slider({
-    name     = "Scan Speed",
-    min      = 0.02, max = 0.5, default = 0.08,
-    suffix   = "s",
+TrainTab:Slider({
+    name = "Scan Speed",
+    min = 0.02, max = 0.5, default = 0.08,
+    suffix = "s",
     callback = function(v)
-        RoadworkApp.ScanSpeed = v
+        RoadworkFarm.ScanSpeed = v
     end,
 })
 
-JobsTab:Slider({
-    name     = "Max Buy Distance",
-    min      = 10, max = 100, default = 30,
-    suffix   = " studs",
+TrainTab:Slider({
+    name = "Max Buy Distance",
+    min = 10, max = 100, default = 30,
+    suffix = " studs",
     callback = function(v)
-        RoadworkApp.MaxBuyDistance = v
+        RoadworkFarm.MaxBuyDistance = v
     end,
 })
 
-JobsTab:Toggle({
-    name     = "Auto Buy After Completion",
-    description = "Buys roadwork ONLY after all items collected",
-    default  = true,
+TrainTab:Toggle({
+    name = "Auto Buy (Spam when in range)",
+    default = true,
     callback = function(v)
-        RoadworkApp.AutoBuy = v
+        RoadworkFarm.AutoBuy = v
     end,
 })
 
-JobsTab:Toggle({
-    name     = "Silent Roadwork",
+TrainTab:Toggle({
+    name = "Silent Roadwork",
     description = "Auto-collect roadwork junk",
-    default  = false,
+    default = false,
     callback = function(v)
-        RoadworkApp.IsFarming = v
-        
-        if RoadworkApp.IsFarming then
-            RoadworkApp:PurgeZones()
-            table.clear(touchedParts)
-            GUI.notify("Started", "Silent Roadwork active.", 2, "success")
-            
-            task.spawn(function()
-                while RoadworkApp.IsFarming do
-                    local character = LocalPlayer.Character
-                    local hrp = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
-                    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-
-                    if hrp and humanoid and humanoid.Health > 0 then
-                        -- 1. If no tool, try to auto-buy first
-                        if not RoadworkApp:HasRoadwork() then
-                            if RoadworkApp.AutoBuy then
-                                local bought = RoadworkApp:AutoBuyButtons()
-                                if bought then
-                                    GUI.notify("Auto Buy", "Roadwork purchased!", 2)
-                                    task.wait(1.5) -- wait for tool to appear
-                                else
-                                    GUI.notify("Auto Buy", "No buy button in range", 2, "warning")
-                                end
-                            end
-                            task.wait(0.2)
-                        end
-
-                        -- 2. Equip + activate tool, then click the selected stat
-                        if RoadworkApp:HasRoadwork() then
-                            RoadworkApp:EquipAndActivateRoadwork()
-                            RoadworkApp:SelectStatUI()
-                        end
-
-                        -- 3. Silent-touch all scan parts
-                        local scanParts = RoadworkApp:GetScanParts()
-                        for _, part in ipairs(scanParts) do
-                            if not RoadworkApp.IsFarming then break end
-                            if not part or not part.Parent or not part:IsDescendantOf(workspace) then
-                                continue
-                            end
-                            pcall(function()
-                                RoadworkApp:SilentTouch(hrp, part)
-                            end)
-                            task.wait(RoadworkApp.ScanSpeed)
-                        end
-                    end
-
-                    task.wait(0.1)
-                end
-            end)
+        if v then
+            RoadworkFarm:Start()
+            GUI.notify("Started", "Silent Roadwork active", 2, "success")
         else
-            GUI.notify("Stopped", "Roadwork halted.", 2)
+            RoadworkFarm:Stop()
+            GUI.notify("Stopped", "Roadwork halted", 2)
         end
     end,
 })
 
-JobsTab:Section({ name = "Stat Selection" })
-JobsTab:Label({ text = "Current stat: " .. RoadworkApp.SelectedStat })
+TrainTab:Section({name = "Stat Selection"})
 
--- Workaround: two buttons instead of dropdown (dropdown unreliable)
-JobsTab:Button({
-    name        = "Select Stamina",
-    description = "Set active stat to Stamina",
-    callback    = function()
-        RoadworkApp.SelectedStat  = "Stamina"
-        StatSettings.SelectedStat = "Stamina"
-        GUI.notify("Stat", "Now using: Stamina", 2)
-    end,
+local StatLabel = nil
+
+local function UpdateStatLabel()
+    if StatLabel then
+        local newText = "Current: " .. RoadworkFarm.SelectedStat
+        pcall(function()
+            if StatLabel.SetText then
+                StatLabel:SetText(newText)
+            elseif StatLabel.Update then
+                StatLabel:Update({text = newText})
+            elseif StatLabel.text then
+                StatLabel.text = newText
+            end
+        end)
+    end
+end
+
+StatLabel = TrainTab:Label({text = "Current: Stamina"})
+
+TrainTab:ButtonGrid({
+    columns = 2,
+    buttons = {
+        {
+            name = "Stamina",
+            callback = function()
+                RoadworkFarm.SelectedStat = "Stamina"
+                UpdateStatLabel()
+                GUI.notify("Stat", "Using: Stamina", 2)
+            end
+        },
+        {
+            name = "Agility",
+            callback = function()
+                RoadworkFarm.SelectedStat = "Agility"
+                UpdateStatLabel()
+                GUI.notify("Stat", "Using: Agility", 2)
+            end
+        },
+    }
 })
 
-JobsTab:Button({
-    name        = "Select Agility",
-    description = "Set active stat to Agility",
-    callback    = function()
-        RoadworkApp.SelectedStat  = "Agility"
-        StatSettings.SelectedStat = "Agility"
-        GUI.notify("Stat", "Now using: Agility", 2)
-    end,
-})
+TrainTab:Separator()
+TrainTab:Label({text = "Stat selection only works at machines"})
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  JOBS TAB
+-- ═══════════════════════════════════════════════════════════════════════════
+
+GUI:NavSection("JOBS")
+local JobsTab = GUI:CreateTab({name = "Jobs"})
+
+JobsTab:Section({name = "Auto Restock Job"})
 
 JobsTab:Toggle({
-    name        = "Auto Select Stat",
-    description = "Automatically clicks selected stat button every 5s",
-    default     = false,
-    callback    = function(v)
-        StatSettings.AutoSelect = v
-        
-        if StatSettings.AutoSelect then
-            GUI.notify("Started", "Auto stat selection active.", 2, "success")
-            task.spawn(function()
-                while StatSettings.AutoSelect do
-                    RoadworkApp:SelectStatUI()
-                    task.wait(5)
-                end
-            end)
+    name = "Auto Restock",
+    description = "Automatically restock shelves at JLF",
+    default = false,
+    callback = function(v)
+        if v then
+            Restock:Start()
+            GUI.notify("Started", "Auto Restock active", 2, "success")
         else
-            GUI.notify("Stopped", "Auto stat selection halted.", 2)
+            Restock:Stop()
+            GUI.notify("Stopped", "Auto Restock halted", 2)
         end
     end,
 })
 
 JobsTab:Separator()
-JobsTab:Label({ text = "Finds closest buy button" })
-JobsTab:Label({ text = "Distance check before buying" })
+JobsTab:Label({text = "📍 Requires JLF proximity"})
+JobsTab:Label({text = "🎯 Uses smart pathfinding"})
 
-GUI:NavSection("JOBS")
-local TrainTab = GUI:CreateTab({ name = "Jobs" })
-
-TrainTab:Section({ name = "Auto Restock Job" })
-
-TrainTab:Toggle({
-    name        = "Auto Restock",
-    description = "Automatically restock shelves at JLF",
-    default     = false,
-    callback    = function(v)
-        restockActive = v
-        
-        if restockActive then
-            _G.StopRestock = nil
-            GUI.notify("Started", "Auto Restock active.", 2, "success")
-            
-            local VirtualUser = game:GetService("VirtualUser")
-            task.spawn(function()
-                while restockActive do
-                    VirtualUser:CaptureController()
-                    VirtualUser:ClickButton2(Vector2.new())
-                    task.wait(60)
-                end
-            end)
-
-            restockThread = task.spawn(function()
-                local ok, err = pcall(runRestockScript)
-                if not ok then
-                    warn("Restock script error: " .. tostring(err))
-                    restockActive = false
-                    GUI.notify("Error", "Restock failed: " .. tostring(err), 4, "error")
-                end
-            end)
-        else
-            _G.StopRestock = true
-            task.wait(0.5)
-            _G.StopRestock = nil
-            
-            if restockThread then
-                task.cancel(restockThread)
-                restockThread = nil
-            end
-            
-            GUI.notify("Stopped", "Auto Restock halted.", 2)
-        end
-    end,
-})
-
-TrainTab:Separator()
-TrainTab:Label({ text = "📍 Restock requires JLF proximity" })
-TrainTab:Label({ text = "🎯 Stat selection works at machines" })
+-- ═══════════════════════════════════════════════════════════════════════════
+--  MISC TAB
+-- ═══════════════════════════════════════════════════════════════════════════
 
 GUI:NavSection("MISC")
-local MiscTab = GUI:CreateTab({ name = "Misc", icon = "🔧" })
+local MiscTab = GUI:CreateTab({name = "Misc", icon = "🔧"})
 
-MiscTab:Section({ name = "Info" })
-MiscTab:Label({ text = "VenturaUI v3.3 • Smart Buy Logic" })
-MiscTab:Label({ text = "Game: [🔥RELEASE] KEN" })
-MiscTab:Chip({ text = "STABLE", color = Color3.fromRGB(60, 200, 100), icon = "✅" })
+MiscTab:Section({name = "Info"})
+MiscTab:Label({text = "Optimized v4.2 • Boxing Gym Safety"})
+MiscTab:Label({text = "Game: [🔥RELEASE] KEN"})
+MiscTab:Chip({text = "STABLE", color = Color3.fromRGB(60, 200, 100), icon = "✅"})
 
-MiscTab:Section({ name = "Controls" })
-MiscTab:ControlHint({ name = "Toggle UI",   key = "Insert", description = "Show / hide window" })
-MiscTab:ControlHint({ name = "Minimize UI", key = "K",      description = "Collapse to titlebar" })
+MiscTab:Section({name = "Controls"})
+MiscTab:ControlHint({name = "Toggle UI", key = "Insert"})
+MiscTab:ControlHint({name = "Minimize UI", key = "K"})
 
-MiscTab:Section({ name = "Utilities" })
+MiscTab:Section({name = "Utilities"})
 MiscTab:ButtonGrid({
     columns = 2,
     buttons = {
-        { name = "Copy UserId", icon = "📋", callback = function()
-            pcall(function() setclipboard(tostring(LocalPlayer.UserId)) end)
-            GUI.notify("Copied!", "UserId: " .. LocalPlayer.UserId, 2, "success")
-        end },
-        { name = "Rejoin", icon = "🔄", callback = function()
-            pcall(function() game:GetService("TeleportService"):Teleport(game.PlaceId) end)
-        end },
+        {
+            name = "Copy UserId",
+            icon = "📋",
+            callback = function()
+                setclipboard(tostring(LocalPlayer.UserId))
+                GUI.notify("Copied", "UserId: " .. LocalPlayer.UserId, 2, "success")
+            end
+        },
+        {
+            name = "Rejoin",
+            icon = "🔄",
+            callback = function()
+                game:GetService("TeleportService"):Teleport(game.PlaceId)
+            end
+        },
     }
 })
 
 task.delay(2, function()
-    GUI.notify("Jobs & Farming Hub", "Loaded! Press Insert to toggle.", 4, "success")
+    GUI.notify("Jobs & Farming Hub", "Loaded! Press Insert to toggle", 4, "success")
 end)
