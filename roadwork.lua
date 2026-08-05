@@ -238,21 +238,25 @@ function RoadworkFarm:Start()
         end
     end)
 
-    -- Auto buy loop: every 3.5s regardless of tool count
+    -- Auto buy: trigger when RoadworkWaypointMarker is removed (session complete)
     task.spawn(function()
-        while self.Active do
-            task.wait(3.5)
-            if not self.Active then break end
-            if self.AutoBuy then
+        local junk = Workspace:FindFirstChild("Junk")
+        if not junk then return end
+
+        junk.ChildRemoved:Connect(function(child)
+            if not self.Active then return end
+            if not self.AutoBuy then return end
+            if child.Name == "RoadworkWaypointMarker_" .. LocalPlayer.UserId then
+                task.wait(0.5)
                 self:AutoBuy()
             end
-        end
+        end)
     end)
 
-    -- Auto equip loop: spam equip every 0.15s
+    -- Auto equip loop: instant spam
     task.spawn(function()
         while self.Active do
-            task.wait(0.1)
+            task.wait()
             if not Character or not RootPart then continue end
             local tool = self:GetTool()
             if tool and tool.Parent ~= Character then
